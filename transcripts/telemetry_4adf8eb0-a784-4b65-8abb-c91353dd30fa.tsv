@@ -1,0 +1,18 @@
+UtteranceID	                             AudioSentTS	AudioReceivedTS	AudioProcessedTS AudioSentToUITS	LatencyMS	Text
+a904e8bc-10a3-4ff2-ac61-c8ee36c50b70	10:30:04.833	10:30:04.833	10:30:09.583	10:30:09.583	4750	How are you feeling today? Good morning, Doctor.
+c9a12b48-8d19-447d-bc39-b1848dba89fe	10:30:06.738	10:30:06.738	10:30:13.542	10:30:13.542	6804	Doctor, I'm not feeling well.
+3ea93174-335a-42c9-a879-9e49225d65b1	10:30:13.543	10:30:13.543	10:30:17.745	10:30:17.745	4202	I see what seems to be the problem.
+80c78d68-8c40-4118-a97c-05f5883ca8d5	10:30:21.498	10:30:21.498	10:30:25.346	10:30:25.346	3848	We have a headache and a sore throat.
+d8bb5c00-2043-4061-8c0f-e3a1da587683	10:30:23.536	10:30:23.536	10:30:29.112	10:30:29.112	5575	How long have you had these symptoms?
+df37d31e-92df-4a0c-9bfe-96f742e39d65	10:30:31.630	10:30:31.630	10:30:36.763	10:30:36.763	5132	For about three days.
+cca6da10-06ad-40bb-9f48-270e4d4084dd	10:30:36.764	10:30:36.764	10:30:41.226	10:30:41.226	4462	Do you have a fever?
+a8c72189-cb7a-4dd3-937f-fb6f429618c1	10:30:55.303	10:30:55.303	10:30:59.701	10:30:59.701	4397	Yes, a little, mostly at night. Are you taking any medicine
+2a1ec6da-6aa3-4256-9f78-4a86d5defe64	10:30:55.928	10:30:55.928	10:31:03.689	10:31:03.689	7761	Just some painkillers, but they don't help much.
+22fab247-a79f-422d-9386-08ec58276048	10:31:03.692	10:31:03.692	10:31:08.097	10:31:08.097	4404	I understand. Do you have any allergies? No, I
+848968fa-493b-4fd5-8c8b-7d7fafdade0d	10:31:04.633	10:31:04.633	10:31:12.639	10:31:12.639	8006	All right. All right.
+83466f02-4d2f-4ddc-9fea-cb776cd8e51b	10:31:12.642	10:31:12.642	10:31:16.980	10:31:16.980	4338	I'll give you some medicine and advice rest. Thank you, Doctor.
+0797bca8-d603-4229-9cb2-2c4fccdd1ce4	10:31:14.828	10:31:14.828	10:31:21.187	10:31:21.187	6358	Doctor, how many days should I rest?
+f1cf544f-1b15-4b95-9701-3bfb3752e285	10:31:21.188	10:31:21.188	10:31:25.253	10:31:25.253	4064	At least three to five days.
+fd14eee2-e7f1-4c1c-80a3-90ff8b0c42f4	10:31:22.032	10:31:22.032	10:31:29.465	10:31:29.465	7433	Drink warm fluids and..
+da5c41e1-7b7a-4a89-8bed-a7293df7e092	10:31:29.466	10:31:29.466	10:31:34.235	10:31:34.235	4768	Take the medicine on time.
+1b2a6548-8e05-4c23-b772-f18a99cbfd86	10:31:30.130	10:31:30.130	10:31:37.733	10:31:37.733	7602	All right.
