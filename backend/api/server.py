@@ -30,7 +30,7 @@ transcriber = WhisperTranscriber(
     logprob_threshold=-0.6      # raised: reject low-confidence tokens earlier
 )
 
-pool = ThreadPoolExecutor(max_workers=2)   # small.en is heavier; 2 workers is enough
+pool = ThreadPoolExecutor(max_workers=3)   # small.en is heavier; 2 workers is enough
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):

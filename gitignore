@@ -9,9 +9,17 @@ venv/
 
 # Node
 node_modules/
+frontend/node_modules/
 
 # Logs
 *.log
+debug_logs/
+test_logs/
 
-# OS files
+# Audio / test files
+*.wav
+*.mp3
+
+# OS
 .DS_Store
+Thumbs.db
