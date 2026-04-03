@@ -1,406 +1,503 @@
-import os
-import time
-import uuid
-import asyncio
-import json
-import numpy as np
-import logging
-import traceback
-from contextlib import asynccontextmanager
-from concurrent.futures import ThreadPoolExecutor
-from datetime import datetime
+"""
+server.py — Production Real-Time Transcription Server
+======================================================
+Architecture:
+  - Run with: uvicorn api.server:app --workers 4 --host 0.0.0.0 --port 8000
+  - Each OS worker process owns its own WhisperTranscriber (model loaded per process)
+  - Per session: full audio accumulation (bytearray, no trimming, no chunk loss)
+  - Live partials: rolling read-only window every PARTIAL_INTERVAL_S seconds
+  - Final flush: single full-buffer Whisper inference on stop/disconnect
+  - Admission control: RAM-based (rejects when free RAM < MIN_FREE_RAM_MB or RAM% > MAX_RAM_PCT)
+  - No hard session count limit — server handles as many clients as hardware allows
+  - ThreadPoolExecutor(max_workers=2) per worker → 8 threads total, balanced across cores
+"""
 
+import os
+import uuid
+import time
+import json
+import asyncio
+import threading
+import traceback
+import logging
+from contextlib import asynccontextmanager
+from datetime import datetime
+from concurrent.futures import ThreadPoolExecutor
+
+import numpy as np
+import psutil
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect
 from fastapi.middleware.cors import CORSMiddleware
-
+from fastapi.responses import JSONResponse
 from core.transcriber import WhisperTranscriber
 from core.punctuator import fix_punctuation
 
-logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s %(levelname)s [pid=%(process)d] %(message)s"
+)
 logger = logging.getLogger(__name__)
 
-# ── Model choice ──────────────────────────────────────────────────────────────
-# small.en is ~4× more accurate than base.en with ~2× slower inference.
-# On a modern CPU this is ~800-1200ms per utterance — acceptable for
-# a consultation transcriber where accuracy matters more than speed.
-# If you have a GPU, inference drops to ~200-400ms.
-transcriber = WhisperTranscriber(
-    model_name="small.en",
-    no_speech_threshold=0.7,    # raised: reject more silence/noise as non-speech
-    logprob_threshold=-0.6      # raised: reject low-confidence tokens earlier
-)
+# ── Per-worker config ──────────────────────────────────────────────────────────
+# Admission control: RAM-based thresholds (not a hard session count)
+# The server accepts connections until real hardware pressure forces a rejection.
+MIN_FREE_RAM_MB  = 600   # Reject if system free RAM drops below this
+MAX_RAM_PCT      = 94.0  # Reject if system RAM% exceeds this
+MAX_CPU_PCT      = 98.0  # Reject if CPU has been pegged at this for >10s (future)
 
-pool = ThreadPoolExecutor(max_workers=3)   # small.en is heavier; 2 workers is enough
+# Hard ceiling: absolute safety net — never allow more than this per worker
+# Set high so RAM threshold fires first under normal conditions.
+HARD_SESSION_CEIL = 30
+
+# Thread pool for Whisper inference: 2 per worker process.
+# 4 workers × 2 threads = 8 active inference threads across all cores.
+EXECUTOR_THREADS = 2
+
+# Live partial transcription interval (rolling read-only window)
+PARTIAL_INTERVAL_S = 3.0          # How often to run rolling-window inference
+PARTIAL_WINDOW_S   = 10.0         # How much audio to feed for partials (seconds)
+
+# Deduplication: ignore words already confirmed within this many seconds
+DEDUP_MARGIN_S     = 0.1
+
+SAMPLE_RATE        = 16000        # 16kHz PCM int16
+BYTES_PER_SAMPLE   = 2            # int16
+SAMPLES_PER_CHUNK  = int(SAMPLE_RATE * 0.1)   # 100ms per chunk
+BYTES_PER_CHUNK    = SAMPLES_PER_CHUNK * BYTES_PER_SAMPLE
+
+OUTPUT_DIR         = r"d:\dummy\transcripts"
+
+# ── Process-level globals (one per uvicorn worker) ─────────────────────────────
+_transcriber: WhisperTranscriber  = None   # type: ignore
+_executor:    ThreadPoolExecutor  = None   # type: ignore
+_active_lock  = threading.Lock()
+_active_sessions: int = 0
+_total_sessions_served: int = 0    # lifetime counter for monitoring
+_total_sessions_rejected: int = 0  # rejected by RAM pressure
+
+
+def _get_proc_ram_mb() -> float:
+    """Real RSS RAM of this worker process in MB."""
+    return psutil.Process(os.getpid()).memory_info().rss / (1024 * 1024)
+
+
+def _admission_check() -> tuple[bool, str]:
+    """
+    Dynamic RAM-based admission gate.
+    Returns (allowed: bool, reason: str).
+    """
+    # Hard ceiling — absolute safety net
+    if _active_sessions >= HARD_SESSION_CEIL:
+        return False, f"hard ceiling reached ({_active_sessions}/{HARD_SESSION_CEIL})"
+
+    vm = psutil.virtual_memory()
+    free_mb = vm.available / (1024 * 1024)
+    ram_pct = vm.percent
+
+    if free_mb < MIN_FREE_RAM_MB:
+        return False, (
+            f"insufficient free RAM: {free_mb:.0f}MB free "
+            f"(threshold={MIN_FREE_RAM_MB}MB)  RAM={ram_pct:.1f}%"
+        )
+
+    if ram_pct > MAX_RAM_PCT:
+        return False, (
+            f"RAM pressure too high: {ram_pct:.1f}% "
+            f"(threshold={MAX_RAM_PCT}%)  free={free_mb:.0f}MB"
+        )
+
+    return True, "ok"
+
+
+async def _resource_monitor():
+    pid = os.getpid()
+    while True:
+        try:
+            vm      = psutil.virtual_memory()
+            cpu     = psutil.cpu_percent()
+            proc_mb = _get_proc_ram_mb()
+            free_mb = vm.available / (1024 * 1024)
+            allowed, reason = _admission_check()
+            gate = "OPEN" if allowed else f"CLOSED ({reason})"
+            logger.info(
+                f"active={_active_sessions}  served={_total_sessions_served}  "
+                f"rejected={_total_sessions_rejected}  "
+                f"proc_ram={proc_mb:.0f}MB  "
+                f"sys_ram={vm.percent:.1f}%  free={free_mb:.0f}MB  "
+                f"CPU={cpu:.1f}%  gate={gate}"
+            )
+            await asyncio.sleep(5)
+        except asyncio.CancelledError:
+            break
+
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
+    global _transcriber, _executor
+    os.makedirs(OUTPUT_DIR, exist_ok=True)
+
+    _executor = ThreadPoolExecutor(
+        max_workers=EXECUTOR_THREADS,
+        thread_name_prefix=f"whisper-w{os.getpid()}"
+    )
+    _transcriber = WhisperTranscriber(
+        model_name="small.en",
+        no_speech_threshold=0.55,
+        logprob_threshold=-0.7,
+        cpu_threads=2,
+        num_workers=1,
+    )
+    logger.info(
+        f"Worker ready. ceil={HARD_SESSION_CEIL} "
+        f"min_free_ram={MIN_FREE_RAM_MB}MB max_ram={MAX_RAM_PCT}% "
+        f"executor_threads={EXECUTOR_THREADS} "
+        f"proc_ram={_get_proc_ram_mb():.0f}MB"
+    )
+    monitor_task = asyncio.create_task(_resource_monitor())
     yield
-    pool.shutdown(wait=True)
+    monitor_task.cancel()
+    _executor.shutdown(wait=False)
 
-app = FastAPI(lifespan=lifespan)
 
+app = FastAPI(lifespan=lifespan, title="Transcription Server")
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],
-    allow_credentials=True,
-    allow_methods=["*"],
-    allow_headers=["*"],
+    allow_origins=["*"], allow_credentials=True,
+    allow_methods=["*"], allow_headers=["*"],
 )
 
 
+@app.get("/status")
+async def status():
+    """Expose per-worker health. Load balancer will round-robin across workers."""
+    vm = psutil.virtual_memory()
+    free_mb = vm.available / (1024 * 1024)
+    allowed, gate_reason = _admission_check()
+    return JSONResponse({
+        "pid":                    os.getpid(),
+        "active_sessions":        _active_sessions,
+        "hard_session_ceil":      HARD_SESSION_CEIL,
+        "sessions_served":        _total_sessions_served,
+        "sessions_rejected":      _total_sessions_rejected,
+        "admission_gate":         "open" if allowed else "closed",
+        "admission_reason":       gate_reason,
+        "min_free_ram_mb":        MIN_FREE_RAM_MB,
+        "max_ram_pct":            MAX_RAM_PCT,
+        "executor_threads":       EXECUTOR_THREADS,
+        "proc_ram_mb":            round(_get_proc_ram_mb(), 1),
+        "sys_ram_pct":            vm.percent,
+        "sys_ram_free_mb":        round(free_mb, 0),
+        "sys_ram_free_gb":        round(vm.available / 1e9, 2),
+        "cpu_pct":                psutil.cpu_percent(),
+    })
+
+
+# ── WebSocket Handler ──────────────────────────────────────────────────────────
 @app.websocket("/ws/consultation/{session_id}")
 async def websocket_transcribe(websocket: WebSocket, session_id: str):
+    global _active_sessions
+
+    # ── Admission control (RAM-based) ─────────────────────────────────────────
+    with _active_lock:
+        allowed, reason = _admission_check()
+        if not allowed:
+            # Reject before accepting the WebSocket handshake
+            await websocket.close(code=4008, reason=f"Server at capacity: {reason}")
+            global _total_sessions_rejected
+            _total_sessions_rejected += 1
+            vm = psutil.virtual_memory()
+            logger.warning(
+                f"[{session_id}] REJECTED — {reason}  "
+                f"(active={_active_sessions}  "
+                f"free={vm.available/1e6:.0f}MB  RAM={vm.percent:.1f}%)"
+            )
+            return
+        _active_sessions += 1
+        global _total_sessions_served
+        _total_sessions_served += 1
+
     await websocket.accept()
-    await websocket.send_json({"type": "connected", "session_id": session_id})
 
-    SAMPLE_RATE        = 16000
-    MAX_BUFFER_S       = 30
-    # Fire rolling inference less often — small.en needs time, and accuracy
-    # benefits from seeing more audio context per pass.
-    PROCESS_INTERVAL_S = 0.6
-    # Confirm words only when they are well inside the buffer, not at the edge
-    # where Whisper is still unstable.
-    CONTEXT_MARGIN_S   = 1.2
-    MAX_PENDING_WORDS  = 25
-    SILENCE_FLUSH_MS   = 600
-    # Energy gates
-    SILENCE_ENERGY     = 0.003   # chunks below this = silence
-    # Minimum mean energy of the WHOLE speech buffer before we bother calling
-    # Whisper.  Prevents transcribing near-silent "breaths" between sentences.
-    MIN_BUFFER_ENERGY  = 0.004
+    # ── Session state ─────────────────────────────────────────────────────────
+    pid            = os.getpid()
+    session_start  = time.time()
+    ts_start_ms    = session_start * 1000
 
-    audio_buffer        = np.array([], dtype=np.float32)
-    session_texts       = []
-    chunk_counter       = 0
-    last_process_time   = time.time()
-    last_confirmed_end  = 0.0
-    buffer_offset_s     = 0.0
-    process_lock        = asyncio.Lock()
-    silence_start: float | None = None
+    # Full audio accumulation — raw int16 bytes, NEVER trimmed
+    full_audio_bytes = bytearray()
 
-    pending_tail_words: list  = []
-    pending_tail_ts:    float = 0.0
-    pending_tail_sent:  float = 0.0
+    # Track position of last confirmed word (in seconds of audio) to deduplicate partials
+    last_confirmed_s = 0.0
 
-    confirmed_words_log: list[str] = []
-    DEDUP_WINDOW = 15
+    # Ordered list of all confirmed transcript segments for final file
+    session_texts: list[str] = []
 
-    os.makedirs(r"d:\dummy\transcripts", exist_ok=True)
-    telemetry_path  = rf"d:\dummy\transcripts\telemetry_{session_id}.tsv"
-    transcript_path = rf"d:\dummy\transcripts\transcript_{session_id}.txt"
+    # Chunk counter (for telemetry)
+    chunks_received = 0
+
+    # Paths
+    telemetry_path  = os.path.join(OUTPUT_DIR, f"telemetry_{session_id}.tsv")
+    transcript_path = os.path.join(OUTPUT_DIR, f"transcript_{session_id}.txt")
+
+    with open(telemetry_path, "w", encoding="utf-8") as f:
+        f.write("UtteranceID\tType\tAudioSentTS\tProcessedTS\tLatencyMS\tInferenceMS\tAudioDurationS\tText\n")
+
+    def fmt_ts(ms: float) -> str:
+        return datetime.fromtimestamp(ms / 1000).strftime("%H:%M:%S.%f")[:-3]
+
+    def append_telemetry(uid: str, kind: str, ts_sent_ms: float, inf_ms: float, dur_s: float, text: str):
+        now_ms = time.time() * 1000
+        try:
+            with open(telemetry_path, "a", encoding="utf-8") as f:
+                f.write(
+                    f"{uid}\t{kind}\t{fmt_ts(ts_sent_ms)}\t{fmt_ts(now_ms)}\t"
+                    f"{int(now_ms - ts_sent_ms)}\t{int(inf_ms)}\t{dur_s:.2f}\t{text}\n"
+                )
+        except Exception:
+            pass
+
+    def audio_bytes_to_float32(raw: bytearray) -> np.ndarray:
+        return np.frombuffer(raw, dtype=np.int16).astype(np.float32) / 32768.0
+
+    # ── Send helpers ──────────────────────────────────────────────────────────
+    async def send_partial(text: str, dur_s: float):
+        if not text.strip():
+            return
+        try:
+            await websocket.send_json({
+                "type":        "partial",
+                "text":        text,
+                "session_id":  session_id,
+                "pid":         pid,
+                "audio_s":     round(dur_s, 2),
+                "active_sessions": _active_sessions,
+            })
+        except Exception:
+            pass
+
+    async def send_transcript(text: str, uid: str, chunk_idx: int, inf_ms: float, is_final: bool):
+        if not text.strip():
+            return
+        try:
+            await websocket.send_json({
+                "type":            "transcript",
+                "text":            text,
+                "utterance_id":    uid,
+                "chunk_index":     chunk_idx,
+                "is_final":        is_final,
+                "inference_ms":    round(inf_ms),
+                "session_id":      session_id,
+                "pid":             pid,
+                "active_sessions": _active_sessions,
+                "proc_ram_mb":     round(_get_proc_ram_mb(), 1),
+            })
+        except Exception:
+            pass
+
+    # ── Partial inference (rolling read-only window) ───────────────────────────
+    # Reads last PARTIAL_WINDOW_S of accumulated audio — does NOT modify full_audio_bytes
+    async def run_partial_inference():
+        nonlocal last_confirmed_s
+        if len(full_audio_bytes) < BYTES_PER_SAMPLE * SAMPLE_RATE:
+            return  # < 1s of audio, skip
+
+        total_dur_s   = len(full_audio_bytes) / (BYTES_PER_SAMPLE * SAMPLE_RATE)
+        window_start_s = max(0.0, total_dur_s - PARTIAL_WINDOW_S)
+        window_start_b = int(window_start_s * SAMPLE_RATE) * BYTES_PER_SAMPLE
+        # align to sample boundary
+        window_start_b = (window_start_b // BYTES_PER_SAMPLE) * BYTES_PER_SAMPLE
+
+        window_bytes  = bytes(full_audio_bytes[window_start_b:])
+        audio_f32     = audio_bytes_to_float32(bytearray(window_bytes))
+        window_dur_s  = len(audio_f32) / SAMPLE_RATE
+
+        loop = asyncio.get_running_loop()
+        try:
+            result = await loop.run_in_executor(
+                _executor,
+                lambda: _transcriber.transcribe_fast(audio_f32, beam_size=1)
+            )
+        except Exception as exc:
+            logger.debug(f"[{session_id}] Partial inference error: {exc}")
+            return
+
+        if not result or not result.words:
+            return
+
+        # Only emit words that are NEW (beyond last_confirmed_s in absolute time)
+        abs_words = [
+            w for w in result.words
+            if (window_start_s + w.start) >= last_confirmed_s - DEDUP_MARGIN_S
+        ]
+        if not abs_words:
+            return
+
+        partial_text = fix_punctuation(
+            "".join(w.word for w in abs_words).strip(),
+            is_final=False
+        )
+        await send_partial(partial_text, total_dur_s)
+
+    # ── Final full-buffer inference ────────────────────────────────────────────
+    async def run_final_inference():
+        nonlocal last_confirmed_s, session_texts
+        if len(full_audio_bytes) == 0:
+            return
+
+        total_dur_s = len(full_audio_bytes) / (BYTES_PER_SAMPLE * SAMPLE_RATE)
+        audio_f32   = audio_bytes_to_float32(full_audio_bytes)
+
+        logger.info(
+            f"[{session_id}] Final inference: {total_dur_s:.1f}s audio, "
+            f"{len(full_audio_bytes)/1024:.0f}KB"
+        )
+        ts_sent = time.time() * 1000
+        loop    = asyncio.get_running_loop()
+
+        try:
+            result = await loop.run_in_executor(
+                _executor,
+                lambda: _transcriber.transcribe_final(audio_f32, beam_size=3)
+            )
+        except Exception as exc:
+            logger.error(f"[{session_id}] Final inference error: {exc}\n{traceback.format_exc()}")
+            return
+
+        if not result or not result.text.strip():
+            logger.warning(f"[{session_id}] Final inference returned no text (dur={total_dur_s:.1f}s)")
+            return
+
+        uid  = str(uuid.uuid4())
+        text = fix_punctuation(result.text.strip(), is_final=True)
+
+        session_texts.append(text)
+        last_confirmed_s = total_dur_s
+
+        await send_transcript(
+            text       = text,
+            uid        = uid,
+            chunk_idx  = chunks_received,
+            inf_ms     = result.inference_ms,
+            is_final   = True,
+        )
+        append_telemetry(uid, "final", ts_sent, result.inference_ms, total_dur_s, text)
+
+        logger.info(
+            f"[{session_id}] Final transcript ({len(text)} chars, "
+            f"inf={result.inference_ms:.0f}ms): {text[:80]}..."
+        )
+
+    # ── Partial scheduler ─────────────────────────────────────────────────────
+    partial_stop_event = asyncio.Event()
+
+    async def partial_scheduler():
+        """Fires partial inference every PARTIAL_INTERVAL_S while session is live."""
+        while not partial_stop_event.is_set():
+            await asyncio.sleep(PARTIAL_INTERVAL_S)
+            if partial_stop_event.is_set():
+                break
+            try:
+                await run_partial_inference()
+            except Exception as exc:
+                logger.debug(f"[{session_id}] Partial scheduler error: {exc}")
+
+    partial_task = asyncio.create_task(partial_scheduler())
+
+    # ── Notify client of successful connection ────────────────────────────────
+    vm = psutil.virtual_memory()
     try:
-        if not os.path.exists(telemetry_path):
-            with open(telemetry_path, "w", encoding="utf-8") as f:
-                f.write("UtteranceID\tAudioSentTS\tAudioReceivedTS\tAudioProcessedTS\tAudioSentToUITS\tLatencyMS\tText\n")
+        await websocket.send_json({
+            "type":             "connected",
+            "session_id":       session_id,
+            "pid":              pid,
+            "active_sessions":  _active_sessions,
+            "sys_ram_pct":      vm.percent,
+            "sys_free_mb":      round(vm.available / 1e6, 0),
+            "proc_ram_mb":      round(_get_proc_ram_mb(), 1),
+        })
     except Exception:
         pass
 
-    def fmt_ts(ms_val):
-        return datetime.fromtimestamp(ms_val / 1000.0).strftime('%H:%M:%S.%f')[:-3]
+    vm = psutil.virtual_memory()
+    logger.info(
+        f"[{session_id}] Connected. "
+        f"active={_active_sessions}  "
+        f"proc_ram={_get_proc_ram_mb():.0f}MB  "
+        f"sys_free={vm.available/1e6:.0f}MB  sys_ram={vm.percent:.1f}%"
+    )
 
-    def has_enough_speech(audio: np.ndarray) -> bool:
-        """
-        Return True only if the audio contains enough energy to be real speech.
-        Prevents Whisper from transcribing near-silent buffers (breath, hum, etc.)
-        which is a primary cause of hallucinated words.
-        """
-        if len(audio) == 0:
-            return False
-        energy = float(np.mean(audio ** 2))
-        if energy < MIN_BUFFER_ENERGY:
-            logger.info(f"[GATE] buffer energy {energy:.5f} below threshold, skipping Whisper")
-            return False
-        return True
-
-    def strip_repeated_prefix(new_words: list) -> list:
-        """Drop leading words that duplicate the tail of confirmed_words_log."""
-        if not confirmed_words_log or not new_words:
-            return new_words
-        tail      = confirmed_words_log[-DEDUP_WINDOW:]
-        new_texts = [w.word.strip().lower() for w in new_words]
-        best_cut  = 0
-        for length in range(1, min(len(tail), len(new_texts)) + 1):
-            if tail[-length:] == new_texts[:length]:
-                best_cut = length
-        if best_cut:
-            logger.info(f"[DEDUP] dropped {best_cut} repeated word(s): {new_texts[:best_cut]}")
-        return new_words[best_cut:]
-
-    def clamp_to_audio(words: list, audio_duration_s: float,
-                       tolerance_s: float = 0.1) -> list:
-        """
-        Reject words whose start timestamp is beyond the actual audio length.
-        Whisper hallucinates tokens past the end of the buffer — this kills them.
-        """
-        limit = audio_duration_s + tolerance_s
-        kept  = [w for w in words if w.start <= limit]
-        dropped = len(words) - len(kept)
-        if dropped:
-            logger.info(f"[CLAMP] dropped {dropped} word(s) past audio end "
-                        f"({audio_duration_s:.2f}s): "
-                        f"{[w.word.strip() for w in words[len(kept):]]}")
-        return kept
-
-    def log_confirmed(words: list):
-        confirmed_words_log.extend(w.word.strip().lower() for w in words)
-        if len(confirmed_words_log) > 300:
-            del confirmed_words_log[:150]
-
-    async def emit_confirmed(text: str, ts_sent: float, inference_ms: float = 0,
-                             words: list | None = None):
-        nonlocal chunk_counter
-        if not text.strip():
-            return
-        chunk_counter += 1
-        now_ms = time.time() * 1000
-        uid    = str(uuid.uuid4())
-        payload = {
-            "type": "transcript",
-            "text": text,
-            "utterance_id": uid,
-            "chunk_index": chunk_counter,
-            "is_final": True,
-            "inference_ms": inference_ms,
-            "timestamps": {
-                "audio_sent_ts":       ts_sent,
-                "audio_received_ts":   ts_sent,
-                "audio_processed_ts":  now_ms,
-                "audio_sent_to_ui_ts": now_ms,
-            },
-        }
-        try:
-            await websocket.send_json(payload)
-        except Exception:
-            pass
-        session_texts.append(text)
-        if words:
-            log_confirmed(words)
-        try:
-            latency = int(now_ms - ts_sent)
-            with open(telemetry_path, "a", encoding="utf-8") as f:
-                f.write(f"{uid}\t{fmt_ts(ts_sent)}\t{fmt_ts(ts_sent)}\t"
-                        f"{fmt_ts(now_ms)}\t{fmt_ts(now_ms)}\t{latency}\t{text}\n")
-        except Exception:
-            pass
-
-    async def flush_tail():
-        nonlocal pending_tail_words, pending_tail_ts, pending_tail_sent, last_confirmed_end
-        if not pending_tail_words:
-            return
-        new_tail = [
-            w for w in pending_tail_words
-            if (buffer_offset_s + w.start) >= last_confirmed_end - 0.05
-        ]
-        new_tail = strip_repeated_prefix(new_tail)
-        if new_tail:
-            tail_text = "".join(w.word for w in new_tail).strip()
-            tail_text = fix_punctuation(tail_text, is_final=True)
-            if tail_text.strip():
-                await emit_confirmed(tail_text, pending_tail_sent, words=new_tail)
-                last_confirmed_end = buffer_offset_s + new_tail[-1].end
-        pending_tail_words = []
-        pending_tail_ts    = 0.0
-        pending_tail_sent  = 0.0
-
-    async def process_buffer(ts_sent: float, force_flush: bool = False):
-        nonlocal audio_buffer, last_confirmed_end, buffer_offset_s
-        nonlocal pending_tail_words, pending_tail_ts, pending_tail_sent
-
-        if process_lock.locked() and not force_flush:
-            return
-
-        async with process_lock:
-
-            if force_flush:
-                await flush_tail()
-
-            if len(audio_buffer) < SAMPLE_RATE * 0.3 and not force_flush:
-                return
-
-            buf_copy = audio_buffer.copy()
-
-            # ── Energy gate: don't call Whisper on near-silent buffers ────────
-            if not has_enough_speech(buf_copy) and not force_flush:
-                return
-
-            buf_duration_s = len(buf_copy) / SAMPLE_RATE
-
-            try:
-                loop   = asyncio.get_running_loop()
-                result = await loop.run_in_executor(
-                    pool,
-                    lambda: transcriber.transcribe(
-                        buf_copy,
-                        utterance_id=str(uuid.uuid4()),
-                        is_final=force_flush,
-                        blocking=True,
-                    ),
-                )
-            except Exception as e:
-                logger.error(f"transcribe error: {e}")
-                return
-
-            if not result or not getattr(result, "words", None) or not result.words:
-                if force_flush:
-                    audio_buffer    = np.array([], dtype=np.float32)
-                    buffer_offset_s += buf_duration_s
-                return
-
-            words = result.words
-
-            def abs_end(w):   return buffer_offset_s + w.end
-            def abs_start(w): return buffer_offset_s + w.start
-
-            # ── Force-flush path ─────────────────────────────────────────────
-            if force_flush:
-                words     = clamp_to_audio(words, buf_duration_s)
-                new_words = [w for w in words if abs_start(w) >= last_confirmed_end - 0.05]
-                new_words = strip_repeated_prefix(new_words)
-                if new_words:
-                    full_text = "".join(w.word for w in new_words).strip()
-                    full_text = fix_punctuation(full_text, is_final=True)
-                    if full_text.strip():
-                        await emit_confirmed(full_text, ts_sent, result.inference_ms,
-                                             words=new_words)
-                        last_confirmed_end = abs_end(new_words[-1])
-
-                keep_s       = 0.5
-                keep_samples = int(keep_s * SAMPLE_RATE)
-                if len(audio_buffer) > keep_samples:
-                    discarded_s      = (len(audio_buffer) - keep_samples) / SAMPLE_RATE
-                    audio_buffer     = audio_buffer[-keep_samples:]
-                    buffer_offset_s += discarded_s
-                else:
-                    audio_buffer    = np.array([], dtype=np.float32)
-                    buffer_offset_s += buf_duration_s
-                return
-
-            # ── Rolling path ─────────────────────────────────────────────────
-            words = clamp_to_audio(words, buf_duration_s)
-
-            safe_boundary = buffer_offset_s + buf_duration_s - CONTEXT_MARGIN_S
-
-            confirm_up_to = -1
-            for i, w in enumerate(words):
-                if abs_end(w) <= safe_boundary:
-                    confirm_up_to = i
-                else:
-                    break
-
-            if len(words) > MAX_PENDING_WORDS and confirm_up_to < MAX_PENDING_WORDS - 1:
-                confirm_up_to = MAX_PENDING_WORDS - 1
-
-            if confirm_up_to >= 0:
-                confirmed_words = words[: confirm_up_to + 1]
-                new_words = [
-                    w for w in confirmed_words
-                    if abs_start(w) >= last_confirmed_end - 0.05
-                ]
-                new_words = strip_repeated_prefix(new_words)
-                if new_words:
-                    confirmed_text = "".join(w.word for w in new_words).strip()
-                    confirmed_text = fix_punctuation(confirmed_text, is_final=False)
-                    if confirmed_text.strip():
-                        await emit_confirmed(confirmed_text, ts_sent, result.inference_ms,
-                                             words=new_words)
-                        last_confirmed_end = abs_end(new_words[-1])
-
-                # No buffer trimming — preserves acoustic context for next pass
-                tail_words = words[confirm_up_to + 1:]
-                if tail_words:
-                    tail_text = "".join(w.word for w in tail_words).strip()
-                    tail_text = fix_punctuation(tail_text, is_final=False)
-                    try:
-                        await websocket.send_json({"type": "partial", "text": tail_text})
-                    except Exception:
-                        pass
-                    if not pending_tail_words:
-                        pending_tail_ts   = time.time()
-                        pending_tail_sent = ts_sent
-                    pending_tail_words = tail_words
-                else:
-                    pending_tail_words = []
-                    pending_tail_ts    = 0.0
-
-            else:
-                partial_text = "".join(w.word for w in words).strip()
-                partial_text = fix_punctuation(partial_text, is_final=False)
-                try:
-                    await websocket.send_json({"type": "partial", "text": partial_text})
-                except Exception:
-                    pass
-                if words:
-                    if not pending_tail_words:
-                        pending_tail_ts   = time.time()
-                        pending_tail_sent = ts_sent
-                    pending_tail_words = words
-
+    # ── Main receive loop ─────────────────────────────────────────────────────
     try:
         while True:
             msg = await websocket.receive()
 
             if "bytes" in msg:
-                raw_bytes = msg["bytes"]
-                ts_sent   = time.time() * 1000
+                raw = msg["bytes"]
+                if not raw:
+                    continue
 
-                pcm_i16   = np.frombuffer(raw_bytes, dtype=np.int16)
-                pcm_float = pcm_i16.astype(np.float32) / 32768.0
-                audio_buffer = np.concatenate([audio_buffer, pcm_float])
-
-                max_samples = SAMPLE_RATE * MAX_BUFFER_S
-                if len(audio_buffer) > max_samples:
-                    overflow         = len(audio_buffer) - max_samples
-                    buffer_offset_s += overflow / SAMPLE_RATE
-                    audio_buffer     = audio_buffer[-max_samples:]
-
-                chunk_energy = float(np.mean(pcm_float ** 2))
-
-                if chunk_energy < SILENCE_ENERGY:
-                    if silence_start is None:
-                        silence_start = time.time()
-                    elif (time.time() - silence_start) * 1000 >= SILENCE_FLUSH_MS:
-                        if pending_tail_words and not process_lock.locked():
-                            await flush_tail()
-                        await process_buffer(ts_sent, force_flush=True)
-                        silence_start = None
-                        continue
-                else:
-                    silence_start = None
-
-                now = time.time()
-                if (now - last_process_time) >= PROCESS_INTERVAL_S:
-                    last_process_time = now
-                    if not process_lock.locked():
-                        asyncio.create_task(process_buffer(ts_sent))
+                # Accumulate ALL audio — never trim, never discard
+                full_audio_bytes.extend(raw)
+                chunks_received += 1
 
             elif "text" in msg:
                 try:
-                    data     = json.loads(msg["text"])
-                    msg_type = data.get("type")
-                    if msg_type == "stop":
-                        await flush_tail()
-                        await process_buffer(time.time() * 1000, force_flush=True)
-                        break
-                    elif msg_type == "ping":
-                        await websocket.send_json({"type": "pong"})
+                    data  = json.loads(msg["text"])
+                    mtype = data.get("type", "")
                 except Exception:
-                    pass
+                    continue
+
+                if mtype == "stop":
+                    logger.info(f"[{session_id}] STOP received after {chunks_received} chunks.")
+                    break
+
+                elif mtype == "ping":
+                    try:
+                        await websocket.send_json({"type": "pong"})
+                    except Exception:
+                        pass
 
     except WebSocketDisconnect:
-        logger.info(f"Session {session_id} disconnected")
-    except Exception as e:
-        logger.error(f"WebSocket error: {traceback.format_exc()}")
+        logger.info(f"[{session_id}] Client disconnected after {chunks_received} chunks.")
+    except Exception as exc:
+        logger.error(f"[{session_id}] Receive loop error: {exc}\n{traceback.format_exc()}")
+
     finally:
-        if pending_tail_words:
+        # ── Shutdown partial scheduler ────────────────────────────────────────
+        partial_stop_event.set()
+        if not partial_task.done():
+            partial_task.cancel()
             try:
-                await flush_tail()
+                await partial_task
+            except asyncio.CancelledError:
+                pass
+
+        # ── Run final full-buffer inference ───────────────────────────────────
+        try:
+            await run_final_inference()
+        except Exception as exc:
+            logger.error(f"[{session_id}] Final inference failed: {exc}")
+
+        # ── Write full transcript file ────────────────────────────────────────
+        if session_texts:
+            full_text = " ".join(session_texts)
+            try:
+                with open(transcript_path, "w", encoding="utf-8") as f:
+                    f.write(full_text)
+                logger.info(f"[{session_id}] Transcript saved: {transcript_path}")
             except Exception:
                 pass
-        if session_texts:
-            with open(transcript_path, "w", encoding="utf-8") as f:
-                f.write(" ".join(session_texts))
 
+        # ── Release session slot ──────────────────────────────────────────────
+        with _active_lock:
+            if _active_sessions > 0:
+                _active_sessions -= 1
 
-if __name__ == "__main__":
-    import uvicorn
-    uvicorn.run("api.server:app", host="0.0.0.0", port=8000, reload=True)
+        session_dur = time.time() - session_start
+        logger.info(
+            f"[{session_id}] Session closed. "
+            f"dur={session_dur:.1f}s  chunks={chunks_received}  "
+            f"audio={len(full_audio_bytes)/1024:.0f}KB  "
+            f"active={_active_sessions}/{MAX_SESSIONS_PER_WORKER}  "
+            f"proc_ram={_get_proc_ram_mb():.0f}MB"
+        )

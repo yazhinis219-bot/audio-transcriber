@@ -1,0 +1,17 @@
+2026-04-02 11:44:11,734 INFO Loading faster-whisper model 'small.en' on cpu with int8...
+2026-04-02 11:44:12,885 INFO HTTP Request: GET https://huggingface.co/api/models/Systran/faster-whisper-small.en/revision/main "HTTP/1.1 200 OK"
+2026-04-02 11:44:13,914 INFO faster-whisper model 'small.en' loaded in 2180ms
+2026-04-02 11:44:13,945 INFO 
+════════════════════════════════════════════════════════════════════
+  🔥  RAM STRESS SERVER
+════════════════════════════════════════════════════════════════════
+  RAM per session : 400 MB
+  Soft-reject at  : 95.0%
+  Pool workers    : 12
+  System RAM      : 12.94 GB used / 3.89 GB free (76.9%)
+════════════════════════════════════════════════════════════════════
+2026-04-02 11:45:38,810 INFO [ADMIT] 9e35921d  sessions=1  pinned=400 MB  RAM=87.4%  free=2.12 GB
+2026-04-02 11:45:38,959 INFO [ADMIT] 2278ff3b  sessions=2  pinned=800 MB  RAM=88.4%  free=1.95 GB
+2026-04-02 11:45:38,963 INFO [ADMIT] 6d40e162  sessions=3  pinned=1200 MB  RAM=88.4%  free=1.95 GB
+2026-04-02 11:45:38,967 INFO [ADMIT] e6c27e32  sessions=4  pinned=1600 MB  RAM=88.4%  free=1.95 GB
+2026-04-02 11:45:38,972 INFO [ADMIT] bb317a68  sessions=5  pinned=2000 MB  RAM=88.4%  free=1.95 GB
