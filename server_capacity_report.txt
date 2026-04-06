@@ -1,0 +1,12 @@
+SERVER CAPACITY REPORT
+Generated: 2026-04-01 10:39:43.440767
+
+================================================================================
+1 CLIENTS TEST
+Chunks Sent: 1208
+Transcripts: 33
+Processing: 0.0273
+Loss: 0.9727
+CPU: 26.82%
+Memory: 10815.35 MB
+Status: FAILED ❌

@@ -1,0 +1,14 @@
+{
+  "name": "realtime-transcription",
+  "version": "1.0.0",
+  "description": "Real-time transcription system with faster-whisper and VAD",
+  "main": "run_gateway.py",
+  "scripts": {
+    "start": "python run_gateway.py",
+    "dev": "RELOAD=1 python run_gateway.py",
+    "install": "pip install -r requirements.txt"
+  },
+  "keywords": ["transcription", "websocket", "audio", "vad", "fastapi", "faster-whisper"],
+  "author": "",
+  "license": "MIT"
+}

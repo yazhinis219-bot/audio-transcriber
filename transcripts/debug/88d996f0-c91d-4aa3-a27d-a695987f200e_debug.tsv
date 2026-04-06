@@ -1,0 +1,18 @@
+T+ Audio Arrived (s)	T+ Sent Worker (s)	T+ Worker Done (s)	T+ Results UI (s)	Audio Len (s)	Process Time (s)	Type	Text / Event
+0.07	1.07	6.09	6.09	1.00	5.03	PARTIAL	Good morning.
+0.77	6.17	10.37	10.37	5.40	4.20	PARTIAL	Good morning. How are you feeling today? I'm not feeling well, doctor.
+1.43	10.43	14.83	14.83	9.00	4.39	PARTIAL	Good morning. How are you feeling today? I'm not feeling well, doctor. I've had a headache and fever since yesterday. I s-
+2.13	14.83	19.45	19.45	12.70	4.62	PARTIAL	Good morning. How are you feeling today? I'm not feeling well, doctor. I've had a headache and fever since yesterday. I see. Do you also have a sore throat or cough?
+2.82	19.52	24.62	24.62	16.70	5.11	PARTIAL	Good morning! How are you feeling today? I'm not feeling well, doctor. I've had a headache and fever since yesterday. I see. Do you also have a sore throat or cough? Yes. I've been coughing a little and my throat feels d...
+3.59	24.69	30.01	30.01	21.10	5.33	PARTIAL	Good morning! How are you feeling today? I'm not feeling well, doctor. I've had a headache and fever since yesterday. I see. Do you also have a sore throat or cough? Yes. I've been coughing a little and my throat feels dry. All right. Let me check your tum-
+4.47	30.07	39.30	39.30	25.60	9.22	FINAL (Sil-Gap)	 Good morning. How are you feeling today? I'm not feeling well, doctor. I've had a headache and fever since yesterday. I see. Do you also have a sore throat or cough? Yes. I've been coughing a little and my throat feels dry. All right. Let me check your temperature. It's slightly high.
+30.92	39.37	43.62	43.62	8.45	4.25	FINAL (Sil-Gap)	 Have you taken any medicine yet? Just some Tylenol, but it didn't help much. Okay.
+39.27	43.70	48.01	48.01	4.43	4.31	PARTIAL	It looks like a mild infection. I'll prescribe you some...
+39.88	48.01	52.14	52.14	8.13	4.12	FINAL (Sil-Gap)	 It looks like a mild infection. I'll prescribe you some antibiotics and stir up for the cough.
+47.47	52.20	56.25	56.25	4.73	4.05	PARTIAL	How long will it take to feel better? Usually within three to four days.
+48.10	56.33	60.83	60.83	8.23	4.50	FINAL (Sil-Gap)	 How long will it take to feel better? Usually within three to four days, if you rest and take the medicine on time.
+56.59	60.92	64.86	64.88	4.33	3.94	FINAL (Sil-Gap)	 All right, I'll do that. Thank you, doctor.
+60.47	64.88	69.01	69.01	4.41	4.14	PARTIAL	Take care, drink plenty of water, and get enough sleep.
+61.10	69.11	73.61	73.61	8.01	4.50	PARTIAL	Take care, drink plenty of water, and get enough sleep. Come back if the fever doesn't go down. I will.
+63.92	73.61	78.17	78.17	9.68	4.56	FINAL (Tail-Pass)	 Take care, drink plenty of water, and get enough sleep. Come back if the fever doesn't go down. I will. Thanks again.
+17.80	78.17	78.17	78.17	60.37	0.00	SESSION END	Emitted Words: 137
