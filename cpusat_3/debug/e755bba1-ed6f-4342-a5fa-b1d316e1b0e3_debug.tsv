@@ -1,7 +1,0 @@
-T+ Audio Arrived (s)	T+ Sent Worker (s)	T+ Worker Done (s)	T+ Results UI (s)	Audio Len (s)	Process Time (s)	Type	Text / Event
-0.00	0.99	16.65	16.65	1.00	5.17	PARTIAL	Good morning.
-1.61	16.71	50.98	50.99	15.10	17.20	PARTIAL	Good morning! How are you feeling today? I'm not feeling well, doctor. I've had a headache and fever since yesterday. I see. Do you also have a sore throat or cough? Yes. I've been coughing a little.
-5.45	51.05	152.04	152.04	45.60	25.80	FINAL (Max-Gap)	 Good morning! How are you feeling today? I'm not feeling well, doctor. I've had a headache and fever since yesterday. I see. Do you also have a sore throat or cough? Yes. I've been coughing a little and my throat feels dry. All right. Let me check your temperature. It's slightly high. Have you taken any medicine yet? Just some Tylenol, but it didn't help much. Okay. It looks like a mild infection. I'll prescribe you some antibiotics and stir up for the cough. How long will it take to feel better? Usually within three to four days.
-5.45	51.05	152.04	152.05	45.60	25.80	PARTIAL (split)	If you rest...
-136.33	152.06	208.04	208.04	15.72	5.69	FINAL (Tail-Pass)	 If you rest and take the medicine on time. All right, I'll do that. Thank you, doctor. Take care, drink plenty of water, and get enough sleep. Come back if the fever doesn't go down. I will. Thanks again.
-147.67	208.04	208.04	208.04	60.37	0.00	SESSION END	Emitted Words: 137
